@@ -35,7 +35,7 @@ use super::find_stride;
 use super::vectorization::Mem256f;
 use super::interface;
 use super::pdf::PDF;
-use super::interface::CommandProcessor;
+use super::interface::{CommandProcessor, StaticCommand};
 use super::context_map_entropy::{ContextMapEntropy, SpeedAndMax, speed_to_tuple};
 pub struct PrefixCodeRange {
   pub offset: u32,
@@ -89,12 +89,14 @@ struct CommandQueue<'a,
                     AllocU8:alloc::Allocator<u8>,
                     AllocU16:alloc::Allocator<u16>,
                     AllocU32:alloc::Allocator<u32>,
-                    AllocF:alloc::Allocator<floatX>> {
+                    AllocF:alloc::Allocator<floatX>,
+                    AllocStaticCommand:alloc::Allocator<StaticCommand>+'a> {
     mb: InputPair<'a>,
     mb_byte_offset: usize,
-    queue: [interface::Command<InputReference<'a> >;COMMAND_BUFFER_SIZE],
+    mc: &'a mut AllocStaticCommand,
+    queue: AllocStaticCommand::AllocatedMemory,
+    pred_mode: interface::PredictionModeContextMap<InputReferenceMut<'a>>,
     loc: usize,
-    last_btypel_index: Option<usize>,
     entropy_tally_scratch: find_stride::EntropyTally<AllocU32>,
     best_strides_per_block_type: AllocU8::AllocatedMemory,
     entropy_pyramid: find_stride::EntropyPyramid<AllocU32>,
@@ -103,14 +105,19 @@ struct CommandQueue<'a,
     high_entropy_detection_quality: u8,
     block_type_literal: u8,
     best_stride_index: usize,
+    overfull: bool,
 }
 
 impl<'a,
      AllocU8:alloc::Allocator<u8>,
      AllocU16:alloc::Allocator<u16>,
      AllocU32:alloc::Allocator<u32>,
-     AllocF:alloc::Allocator<floatX> > CommandQueue<'a, AllocU8, AllocU16, AllocU32, AllocF> {
+     AllocF:alloc::Allocator<floatX>,
+     AllocStaticCommand:alloc::Allocator<StaticCommand>> CommandQueue<'a, AllocU8, AllocU16, AllocU32, AllocF, AllocStaticCommand> {
     fn new(_m32: &mut AllocU32,
+           mc: &'a mut AllocStaticCommand,
+           num_commands: usize,
+           pred_mode: interface::PredictionModeContextMap<InputReferenceMut<'a>>,
            mb: InputPair<'a>,
            stride_detection_quality: u8,
            high_entropy_detection_quality: u8,
@@ -118,25 +125,36 @@ impl<'a,
            best_strides: AllocU8::AllocatedMemory,
            entropy_tally_scratch: find_stride::EntropyTally<AllocU32>,
            entropy_pyramid: find_stride::EntropyPyramid<AllocU32>,
-           ) -> CommandQueue <'a, AllocU8, AllocU16, AllocU32, AllocF> {
+           ) -> CommandQueue <'a, AllocU8, AllocU16, AllocU32, AllocF, AllocStaticCommand> {
+
+        // assume no more than 1/16 of the stream is block_types which may chop up literals
+        // also there's the first btypel and a potential wrap around the ring buffer
+        let queue = mc.alloc_cell(num_commands * 17 / 16 + 4);
         CommandQueue {
             mb:mb,
+            mc:mc,
+            queue: queue, // always need a spare command in case the ring buffer splits a literal into two
+            pred_mode:pred_mode,
             mb_byte_offset:0,
-            queue:[interface::Command::<InputReference<'a>>::default();COMMAND_BUFFER_SIZE],
             loc:0,
             best_strides_per_block_type: best_strides,
             entropy_tally_scratch: entropy_tally_scratch,
             entropy_pyramid: entropy_pyramid,
-            last_btypel_index: None,
             stride_detection_quality: stride_detection_quality,
             high_entropy_detection_quality: high_entropy_detection_quality,
             context_map_entropy: context_map_entropy,
             block_type_literal: 0,
             best_stride_index: 0,
+            overfull: false,
         }
     }
     fn full(&self) -> bool {
         self.loc == self.queue.len()
+    }
+    fn error_if_full(&mut self) {
+        if self.full() {
+            self.overfull = true;
+        }
     }
     fn size(&self) -> usize {
         self.loc
@@ -145,92 +163,56 @@ impl<'a,
         self.loc = 0;
         self.block_type_literal = 0;
     }
-    fn content(&mut self) -> &[interface::Command<InputReference>] {
-        self.queue.split_at(self.loc).0
-    }
-    fn flush<Cb>(&mut self, callback: &mut Cb) where Cb:FnMut(&[interface::Command<InputReference>]) {
-       let mut _local_byte_offset = self.mb_byte_offset;
-       let cur_stride;
-       if self.stride_detection_quality == 1 || self.stride_detection_quality == 2 { 
-           cur_stride = self.entropy_tally_scratch.pick_best_stride(self.queue.split_at(self.loc).0,
-                                                                    self.mb.0,
-                                                                    self.mb.1,
-                                                                    &mut self.mb_byte_offset,
-                                                                    &self.entropy_pyramid,
-                                                                    self.stride_detection_quality);
-       } else if self.best_stride_index < self.best_strides_per_block_type.slice().len() {
-           cur_stride = self.best_strides_per_block_type.slice()[self.best_stride_index];
-       } else {
-           cur_stride = 0;
-       }
-       if self.high_entropy_detection_quality > 1 {
-           for command in self.queue.split_at_mut(self.loc).0.iter_mut() {
-               match *command {
-                   interface::Command::BlockSwitchCommand(_) |
-                   interface::Command::BlockSwitchDistance(_) |
-                   interface::Command::PredictionMode(_) => {},
-                   interface::Command::BlockSwitchLiteral(bs) => {
-                      self.block_type_literal = bs.block_type();
-                   },
-                   interface::Command::Copy(ref copy) => {
-                       _local_byte_offset += copy.num_bytes as usize;
-                   },
-                   interface::Command::Dict(ref dict) => {
-                       _local_byte_offset += dict.final_size as usize;
-                   },
-                   interface::Command::Literal(ref mut lit) => {
-                       _local_byte_offset += lit.data.slice().len();
-                   }
-               }
-           }
-       }
-       match self.last_btypel_index.clone() {
-           None => {},
-           Some(literal_block_type_offset) => {
-               match &mut self.queue[literal_block_type_offset] {
-                   &mut interface::Command::BlockSwitchLiteral(ref mut cmd) => {
-                       cmd.1 = cur_stride;
-                   },
-                   _ => panic!("Logic Error: literal block type index must point to literal block type"),
-               }
-               self.best_stride_index += 1;
-           },
-       }
-       self.last_btypel_index = None;
-       callback(self.queue.split_at(self.loc).0);
-       self.clear();
+    fn flush<Cb>(&mut self, callback: &mut Cb) where Cb:FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                              &mut[interface::StaticCommand],
+                                                              InputPair) {
+        callback(&mut self.pred_mode, self.queue.slice_mut().split_at_mut(self.loc).0, self.mb);
+        self.clear();
     }
     fn free<Cb>(&mut self, m8: &mut AllocU8, m16: &mut AllocU16, m32: &mut AllocU32, mf64: &mut AllocF,
-                callback: &mut Cb) where Cb:FnMut(&[interface::Command<InputReference>]) {
+                callback: &mut Cb) -> Result<(), ()> where Cb:FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                  &mut [interface::StaticCommand],
+                                                  InputPair) {
        self.flush(callback);
        self.entropy_tally_scratch.free(m32);
        self.entropy_pyramid.free(m32);
        self.context_map_entropy.free(m16, m32, mf64);
-       m8.free_cell(core::mem::replace(&mut self.best_strides_per_block_type, AllocU8::AllocatedMemory::default()))
+       self.mc.free_cell(core::mem::replace(&mut self.queue, AllocStaticCommand::AllocatedMemory::default()));
+       m8.free_cell(core::mem::replace(&mut self.best_strides_per_block_type, AllocU8::AllocatedMemory::default()));
+       if self.overfull {
+          return Err(());
+       }
+       Ok(())
     }
 }
+
 impl<'a,
      AllocU8: alloc::Allocator<u8>,
      AllocU16: alloc::Allocator<u16>,
      AllocU32: alloc::Allocator<u32>,
-     AllocF: alloc::Allocator<floatX>> interface::CommandProcessor<'a> for CommandQueue<'a,
+     AllocF: alloc::Allocator<floatX>,
+     AllocStaticCommand: alloc::Allocator<StaticCommand>> interface::CommandProcessor<'a> for CommandQueue<'a,
                                                                                         AllocU8,
                                                                                         AllocU16,
                                                                                         AllocU32,
-                                                                                        AllocF> {
-    fn push<Cb> (&mut self, val: interface::Command<InputReference<'a> >, callback :&mut Cb)
-     where Cb: FnMut(&[interface::Command<InputReference>]) {
-        self.queue[self.loc] = val;
-        self.loc += 1;
+                                                                                        AllocF,
+                                                                                        AllocStaticCommand> {
+    fn push (&mut self, val: interface::Command<InputReference<'a> >) {
         if self.full() {
-            self.flush(callback);
+            let mut tmp = self.mc.alloc_cell(self.queue.slice().len() * 2);
+            tmp.slice_mut().split_at_mut(self.queue.slice().len()).0.clone_from_slice(self.queue.slice());
+            self.mc.free_cell(core::mem::replace(&mut self.queue, tmp));
+        }
+        if !self.full() {
+            self.queue.slice_mut()[self.loc] = val.freeze();
+            self.loc += 1;
+        } else {
+            self.error_if_full();
         }
     }
-    fn push_block_switch_literal<Cb>(&mut self, block_type: u8, callback: &mut Cb) where Cb:FnMut(&[interface::Command<InputReference>]) {
-        self.flush(callback);
-        self.last_btypel_index = Some(self.size());
+    fn push_block_switch_literal(&mut self, block_type: u8) {
         self.push(interface::Command::BlockSwitchLiteral(
-            interface::LiteralBlockSwitch::new(block_type, 0)), callback)
+            interface::LiteralBlockSwitch::new(block_type, 0)))
     }
 }
 
@@ -247,7 +229,8 @@ impl<'a,
      AllocU8: alloc::Allocator<u8>,
      AllocU16: alloc::Allocator<u16>,
      AllocU32: alloc::Allocator<u32>,
-     AllocF: alloc::Allocator<floatX>> Drop for CommandQueue<'a, AllocU8, AllocU16, AllocU32, AllocF> {
+     AllocF: alloc::Allocator<floatX>,
+     AllocStaticCommand: alloc::Allocator<StaticCommand>> Drop for CommandQueue<'a, AllocU8, AllocU16, AllocU32, AllocF, AllocStaticCommand> {
   fn drop(&mut self) {
       if !self.entropy_tally_scratch.is_free() {
           warn_on_missing_free();
@@ -286,7 +269,7 @@ fn best_speed_log(name:&str,
 
 }
 
-fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), CmdProcessor: interface::CommandProcessor<'a> > (
+fn process_command_queue<'a, CmdProcessor: interface::CommandProcessor<'a> > (
     command_queue: &mut CmdProcessor,
     input: InputPair<'a>,
     commands: &[Command],
@@ -295,7 +278,6 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
     block_type: &MetaBlockSplitRefs,
     params: &BrotliEncoderParams,
     context_type:Option<ContextType>,
-    callback: &mut Cb,
 ) -> RecoderState {
     let mut input_iter = input.clone();
     let mut local_dist_cache = [0i32;kNumDistanceCacheEntries];
@@ -307,7 +289,7 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
     let mut btypec_sub = if block_type.btypec.num_types == 1 { 1u32<<31 } else {block_type.btypec.lengths[0]};
     let mut btyped_sub = if block_type.btyped.num_types == 1 { 1u32<<31 } else {block_type.btyped.lengths[0]};
     {
-        command_queue.push_block_switch_literal(0, callback);
+        command_queue.push_block_switch_literal(0);
     }
     let mut mb_len = input.len();
     for cmd in commands.iter() {
@@ -336,11 +318,11 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
                 let (in_a, in_b) = tmp_inserts.split_at(btypel_sub as usize);
                 if in_a.len() != 0 {
                     if let Some(_) = context_type {
-                        command_queue.push_literals(&in_a, callback);
+                        command_queue.push_literals(&in_a);
                     } else if params.high_entropy_detection_quality == 0 {
-                        command_queue.push_literals(&in_a, callback);
+                        command_queue.push_literals(&in_a);
                     } else {
-                        command_queue.push_rand_literals(&in_a, callback);
+                        command_queue.push_rand_literals(&in_a);
                     }
                 }
                 mb_len -= in_a.len();
@@ -348,17 +330,17 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
                 btypel_counter += 1;
                 if block_type.btypel.types.len() > btypel_counter {
                     btypel_sub = block_type.btypel.lengths[btypel_counter];
-                    command_queue.push_block_switch_literal(block_type.btypel.types[btypel_counter], callback);
+                    command_queue.push_block_switch_literal(block_type.btypel.types[btypel_counter]);
                 } else {
                     btypel_sub = 1u32<<31;
                 }
             }
             if let Some(_) = context_type {
-                command_queue.push_literals(&tmp_inserts, callback);
+                command_queue.push_literals(&tmp_inserts);
             } else if params.high_entropy_detection_quality == 0 {
-                command_queue.push_literals(&tmp_inserts, callback);
+                command_queue.push_literals(&tmp_inserts);
             }else {
-                command_queue.push_rand_literals(&tmp_inserts, callback);
+                command_queue.push_rand_literals(&tmp_inserts);
             }
             if tmp_inserts.len() != 0 {
                 mb_len -= tmp_inserts.len();
@@ -387,16 +369,18 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
                         final_size: actual_copy_len as u8,
                         empty: 0,
                         word_id: word_sub_index as u32,
-                    }), callback);
+                    }));
                 mb_len -= actual_copy_len;
-                assert_eq!(InputPair(transformed_word.split_at(actual_copy_len).0, &[]),
+                assert_eq!(InputPair(InputReference{data:transformed_word.split_at(actual_copy_len).0, orig_offset:0},
+                                     InputReference::default()),
                            interim.split_at(actual_copy_len).0);
             } else if mb_len != 0 {
                 // truncated dictionary word: represent it as literals instead
                 // won't be random noise since it fits in the dictionary, so we won't check for rand
-                command_queue.push_literals(&interim.split_at(mb_len).0, callback);
+                command_queue.push_literals(&interim.split_at(mb_len).0);
                 mb_len = 0;
-                assert_eq!(InputPair(transformed_word.split_at(mb_len).0, &[]),
+                assert_eq!(InputPair(InputReference{data:transformed_word.split_at(mb_len).0, orig_offset:0},
+                                     InputReference::default()),
                            interim.split_at(mb_len).0);
             }
         } else {
@@ -406,7 +390,7 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
                     interface::CopyCommand{
                         distance: final_distance as u32,
                         num_bytes: actual_copy_len as u32,
-                    }), callback);
+                    }));
             }
             mb_len -= actual_copy_len;
             if prev_dist_index != 1 || dist_offset != 0 { // update distance cache unless it's the "0 distance symbol"
@@ -424,8 +408,7 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
                 if block_type.btypec.types.len() > btypec_counter {
                     btypec_sub = block_type.btypec.lengths[btypec_counter];
                     command_queue.push(interface::Command::BlockSwitchCommand(
-                        interface::BlockSwitch(block_type.btypec.types[btypec_counter])),
-                                       callback);
+                        interface::BlockSwitch(block_type.btypec.types[btypec_counter])));
                 } else {
                     btypec_sub = 1u32 << 31;
                 }
@@ -438,7 +421,7 @@ fn process_command_queue<'a, Cb:FnMut(&[interface::Command<InputReference>]), Cm
                 if block_type.btyped.types.len() > btyped_counter {
                     btyped_sub = block_type.btyped.lengths[btyped_counter];
                     command_queue.push(interface::Command::BlockSwitchDistance(
-                        interface::BlockSwitch(block_type.btyped.types[btyped_counter])), callback);
+                        interface::BlockSwitch(block_type.btyped.types[btyped_counter])));
                 } else {
                     btyped_sub = 1u32 << 31;
                 }
@@ -459,19 +442,23 @@ fn LogMetaBlock<'a,
                 AllocF:alloc::Allocator<floatX>,
                 AllocFV:alloc::Allocator<Mem256f>,
                 AllocPDF: alloc::Allocator<PDF>,
+                AllocStaticCommand: alloc::Allocator<StaticCommand>,
                 Cb>(m8: &mut AllocU8,
                     m16: &mut AllocU16,
                     m32: &mut AllocU32,
                     mf: &mut AllocF,
                     _mfv: &mut AllocFV,
                     _mpdf: &mut AllocPDF,
+                    mc: &mut AllocStaticCommand,
                     commands: &[Command], input0: &'a[u8],input1: &'a[u8],
                     dist_cache: &[i32;kNumDistanceCacheEntries],
                     recoder_state :&mut RecoderState,
                     block_type: MetaBlockSplitRefs,
                     params: &BrotliEncoderParams,
                     context_type:Option<ContextType>,
-                    callback: &mut Cb) where Cb:FnMut(&[interface::Command<InputReference>]){
+                    callback: &mut Cb) where Cb:FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                      &mut [interface::StaticCommand],
+                                                      InputPair){
     let mut local_literal_context_map = [0u8; 256 * 64];
     let mut local_distance_context_map = [0u8; 256 * 64 + interface::DISTANCE_CONTEXT_MAP_OFFSET];
     assert_eq!(*block_type.btypel.types.iter().max().unwrap_or(&0) as u32 + 1,
@@ -492,8 +479,13 @@ fn LogMetaBlock<'a,
     }
     
     let mut prediction_mode = interface::PredictionModeContextMap::<InputReferenceMut>{
-        literal_context_map:InputReferenceMut(local_literal_context_map.split_at_mut(block_type.literal_context_map.len()).0),
-        predmode_speed_and_distance_context_map:InputReferenceMut(local_distance_context_map.split_at_mut(interface::PredictionModeContextMap::<InputReference>::size_of_combined_array(block_type.distance_context_map.len())).0),
+        literal_context_map:InputReferenceMut{
+            data:local_literal_context_map.split_at_mut(block_type.literal_context_map.len()).0,
+            orig_offset:0},
+        predmode_speed_and_distance_context_map:InputReferenceMut{
+            data: local_distance_context_map.split_at_mut(interface::PredictionModeContextMap::<InputReference>::size_of_combined_array(block_type.distance_context_map.len())).0,
+            orig_offset: 0,
+        },
     };
     for item in prediction_mode.get_mixing_values_mut().iter_mut() {
         *item = prior_eval::WhichPrior::STRIDE1 as u8;
@@ -513,13 +505,13 @@ fn LogMetaBlock<'a,
         entropy_tally_scratch = find_stride::EntropyTally::<AllocU32>::disabled_placeholder(m32);
         entropy_pyramid = find_stride::EntropyPyramid::<AllocU32>::disabled_placeholder(m32);
     }
-    let input = InputPair(input0, input1);
+    let input = InputPair(InputReference{data:input0, orig_offset:0}, InputReference{data:input1, orig_offset:input0.len()});
     let mut best_strides = AllocU8::AllocatedMemory::default();
     if params.stride_detection_quality > 2 {
          let mut stride_selector = stride_eval::StrideEval::<AllocU16,
                                                            AllocU32,
                                                            AllocF>::new(m16, m32, mf,
-                                                                        InputPair(input0, input1),
+                                                                        input,
                                                                         &prediction_mode,
                                                                         &params);
         process_command_queue(&mut stride_selector,
@@ -529,12 +521,11 @@ fn LogMetaBlock<'a,
                               *recoder_state,
                               &block_type,
                               params,
-                              context_type,
-                              &mut |_x|());
+                              context_type);
         best_strides = m8.alloc_cell(stride_selector.num_types());
         stride_selector.choose_stride(best_strides.slice_mut());
     }
-    let mut context_map_entropy = ContextMapEntropy::<AllocU16, AllocU32, AllocF>::new(m16, m32, mf, InputPair(input0, input1),
+    let mut context_map_entropy = ContextMapEntropy::<AllocU16, AllocU32, AllocF>::new(m16, m32, mf, input,
                                                                                        entropy_pyramid.stride_last_level_range(),
                                                                                        prediction_mode,
                                                                                        params.cdf_adaptation_detection);
@@ -546,8 +537,7 @@ fn LogMetaBlock<'a,
                          *recoder_state,
                          &block_type,
                          params,
-                         context_type,
-                          &mut |_x|());
+                         context_type);
         {
             let (cm_speed, cm_cost) = context_map_entropy.best_singleton_speeds(true, false);
             let (stride_speed, stride_cost) = context_map_entropy.best_singleton_speeds(false, false);
@@ -573,7 +563,7 @@ fn LogMetaBlock<'a,
      }
      let mut prior_selector = prior_eval::PriorEval::<AllocU16,
                                                       AllocU32,
-                                                      AllocF>::new(m16, m32, mf, InputPair(input0, input1),
+                                                      AllocF>::new(m16, m32, mf, input,
                                                                    entropy_pyramid.stride_last_level_range(),
                                                                    context_map_entropy.take_prediction_mode(),
                                                                    &params);
@@ -585,13 +575,14 @@ fn LogMetaBlock<'a,
                          *recoder_state,
                          &block_type,
                          params,
-                         context_type,
-                              &mut |_x|());
+                         context_type);
         prior_selector.choose_bitmask();
      }     
      let prediction_mode = prior_selector.take_prediction_mode();
      prior_selector.free(m16, m32, mf);
-     let mut command_queue = CommandQueue::new(m32, InputPair(input0, input1),
+     let mut command_queue = CommandQueue::new(m32, mc, commands.len(),
+                                               prediction_mode,
+                                               input,
                                                params.stride_detection_quality,
                                                params.high_entropy_detection_quality,
                                                context_map_entropy,
@@ -599,9 +590,6 @@ fn LogMetaBlock<'a,
                                                entropy_tally_scratch,
                                                entropy_pyramid);
 
-    command_queue.push(interface::Command::PredictionMode(
-        interface::PredictionModeContextMap::<InputReference>::from_mut(prediction_mode)),
-        callback);
      
     *recoder_state = process_command_queue(&mut command_queue,
                                            input,
@@ -610,9 +598,8 @@ fn LogMetaBlock<'a,
                                            *recoder_state,
                                            &block_type,
                                            params,
-                                           context_type,
-                                           callback);
-    command_queue.free(m8, m16, m32, mf, callback);
+                                           context_type);
+    command_queue.free(m8, m16, m32, mf, callback).unwrap();
 //   ::std::io::stderr().write(input0).unwrap();
 //   ::std::io::stderr().write(input1).unwrap();
 }
@@ -2145,6 +2132,7 @@ pub fn BrotliStoreMetaBlock<'a,
                             AllocF: alloc::Allocator<floatX>,
                             AllocFV:alloc::Allocator<Mem256f>,
                             AllocPDF: alloc::Allocator<PDF>,
+                            AllocStaticCommand: alloc::Allocator<StaticCommand>,
                             AllocHT: alloc::Allocator<HuffmanTree>,
                             AllocHL: alloc::Allocator<HistogramLiteral>,
                             AllocHC: alloc::Allocator<HistogramCommand>,
@@ -2156,6 +2144,7 @@ pub fn BrotliStoreMetaBlock<'a,
    mf: &mut AllocF,
    mfv: &mut AllocFV,
    mpdf: &mut AllocPDF,
+   mc: &mut AllocStaticCommand,
    mht: &mut AllocHT,
    input: &'a[u8],
    start_pos: usize,
@@ -2173,10 +2162,12 @@ pub fn BrotliStoreMetaBlock<'a,
    recoder_state: &mut RecoderState,
    storage_ix: &mut usize,
    storage: &mut [u8],
-  callback: &mut Cb) where Cb: FnMut(&[interface::Command<InputReference>]) {
+  callback: &mut Cb) where Cb: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                  &mut[interface::StaticCommand],
+                                                  InputPair) {
   let (input0,input1) = InputPairFromMaskedInput(input, start_pos, length, mask);
   if params.log_meta_block {
-      LogMetaBlock(m8, m16, m32, mf, mfv, mpdf, commands.split_at(n_commands).0, input0, input1,
+      LogMetaBlock(m8, m16, m32, mf, mfv, mpdf, mc, commands.split_at(n_commands).0, input0, input1,
                    distance_cache,
                    recoder_state,
                    block_split_reference(mb),
@@ -2466,6 +2457,7 @@ pub fn BrotliStoreMetaBlockTrivial<'a,
                                    AllocF:alloc::Allocator<floatX>,
                                    AllocFV:alloc::Allocator<Mem256f>,
                                    AllocPDF:alloc::Allocator<PDF>,
+                                   AllocStaticCommand: alloc::Allocator<StaticCommand>,
                                    Cb>
     (m8: &mut AllocU8,
      m16:&mut AllocU16,
@@ -2473,6 +2465,7 @@ pub fn BrotliStoreMetaBlockTrivial<'a,
      mf:&mut AllocF,
      mfv:&mut AllocFV,
      mpdf:&mut AllocPDF,
+     mc:&mut AllocStaticCommand,
      input: &'a [u8],
      start_pos: usize,
      length: usize,
@@ -2485,7 +2478,9 @@ pub fn BrotliStoreMetaBlockTrivial<'a,
      recoder_state: &mut RecoderState,
      storage_ix: &mut usize,
      storage: &mut [u8],
-    f:&mut Cb) where Cb: FnMut(&[interface::Command<InputReference>]) {
+    f:&mut Cb) where Cb: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                               &mut [interface::StaticCommand],
+                               InputPair) {
   let (input0,input1) = InputPairFromMaskedInput(input, start_pos, length, mask);
   if params.log_meta_block {
       LogMetaBlock(m8,
@@ -2494,6 +2489,7 @@ pub fn BrotliStoreMetaBlockTrivial<'a,
                    mf,
                    mfv,
                    mpdf,
+                   mc,
                    commands.split_at(n_commands).0,
                    input0,
                    input1,
@@ -2664,6 +2660,7 @@ pub fn BrotliStoreMetaBlockFast<Cb,
                                 AllocF:alloc::Allocator<floatX>,
                                 AllocFV:alloc::Allocator<Mem256f>,
                                 AllocPDF:alloc::Allocator<PDF>,
+                                AllocStaticCommand: alloc::Allocator<StaticCommand>,
                                 AllocHT: alloc::Allocator<HuffmanTree>>(m : &mut AllocHT,
                                                                         m8:  &mut AllocU8,
                                                                         m16: &mut AllocU16,
@@ -2671,6 +2668,7 @@ pub fn BrotliStoreMetaBlockFast<Cb,
                                                                         mf: &mut AllocF,
                                                                         mfv: &mut AllocFV,
                                                                         mpdf: &mut AllocPDF,
+                                                                        mc: &mut AllocStaticCommand,
                                 input: &[u8],
                                 start_pos: usize,
                                 length: usize,
@@ -2683,7 +2681,9 @@ pub fn BrotliStoreMetaBlockFast<Cb,
                                 recoder_state: &mut RecoderState,
                                 storage_ix: &mut usize,
                                 storage: &mut [u8],
-                                cb: &mut Cb) where Cb: FnMut(&[interface::Command<InputReference>]) {
+                                cb: &mut Cb) where Cb: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                  &mut [interface::StaticCommand],
+                                                  InputPair) {
   let (input0,input1) = InputPairFromMaskedInput(input, start_pos, length, mask);
   if params.log_meta_block {
       LogMetaBlock(m8,
@@ -2692,6 +2692,7 @@ pub fn BrotliStoreMetaBlockFast<Cb,
                    mf,
                    mfv,
                    mpdf,
+                   mc,
                    commands.split_at(n_commands).0, input0, input1, dist_cache, recoder_state,
                    block_split_nop(),
                    params,
@@ -2843,13 +2844,15 @@ pub fn BrotliStoreUncompressedMetaBlock<Cb,
                                         AllocU32:alloc::Allocator<u32>,
                                         AllocF:alloc::Allocator<floatX>,
                                         AllocFV:alloc::Allocator<Mem256f>,
-                                        AllocPDF:alloc::Allocator<PDF>>
+                                        AllocPDF:alloc::Allocator<PDF>,
+                                        AllocStaticCommand: alloc::Allocator<StaticCommand>>
     (m8: &mut AllocU8,
      m16:&mut AllocU16,
      m32:&mut AllocU32,
      mf:&mut AllocF,
      mfv: &mut AllocFV,
      mpdf: &mut AllocPDF,
+     mc: &mut AllocStaticCommand,
      is_final_block: i32,
      input: &[u8],
      position: usize,
@@ -2860,7 +2863,9 @@ pub fn BrotliStoreUncompressedMetaBlock<Cb,
      storage_ix: &mut usize,
      storage: &mut [u8],
      suppress_meta_block_logging: bool,
-     cb: &mut Cb) where Cb: FnMut(&[interface::Command<InputReference>]){
+     cb: &mut Cb) where Cb: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                  &mut [interface::StaticCommand],
+                                  InputPair){
   let (input0,input1) = InputPairFromMaskedInput(input, position, len, mask);
   BrotliStoreUncompressedMetaBlockHeader(len, storage_ix, storage);
   JumpToByteBoundary(storage_ix, storage);
@@ -2879,7 +2884,7 @@ pub fn BrotliStoreUncompressedMetaBlock<Cb,
                         dist_prefix_:0
     }];
 
-    LogMetaBlock(m8, m16, m32, mf, mfv, mpdf, &cmds, input0, input1, &[0i32, 0i32, 0i32, 0i32], recoder_state,
+    LogMetaBlock(m8, m16, m32, mf, mfv, mpdf, mc, &cmds, input0, input1, &[0i32, 0i32, 0i32, 0i32], recoder_state,
                  block_split_nop(),
                  params,
                  None,

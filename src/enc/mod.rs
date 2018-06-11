@@ -45,11 +45,14 @@ use self::encode::{BrotliEncoderCreateInstance, BrotliEncoderDestroyInstance,
                    BrotliEncoderOperation,
                    BrotliEncoderCompressStream, BrotliEncoderIsFinished};
 use self::cluster::{HistogramPair};
+pub use self::interface::StaticCommand;
 use self::histogram::{ContextType, HistogramLiteral, HistogramCommand, HistogramDistance};
 use self::command::{Command};
 use self::entropy_encode::{HuffmanTree};
 use brotli_decompressor::{CustomRead, CustomWrite};
 pub use self::vectorization::{v128,v128i,v256,v256i, Mem256f};
+pub use interface::{InputReference,InputPair, InputReferenceMut};
+
 
 #[cfg(not(feature="no-stdlib"))]
 use std::io::{Read,Write, Error, ErrorKind};
@@ -88,6 +91,7 @@ pub fn BrotliCompress<InputType, OutputType>(r: &mut InputType,
                             HeapAlloc::<floatX> { default_value: 0.0 as floatX },
                             HeapAlloc::<Mem256f> { default_value: Mem256f::default() },
                             HeapAlloc::<PDF> { default_value: PDF::default() },
+                            HeapAlloc::<StaticCommand> { default_value: StaticCommand::default() },
                             HeapAlloc::<HistogramLiteral>{
                                 default_value: HistogramLiteral::default(),
                             },
@@ -123,6 +127,7 @@ pub fn BrotliCompressCustomAlloc<InputType,
                                  AllocF64: Allocator<util::floatX>,
                                  AllocFV: Allocator<Mem256f>,
                                  AllocPDF: Allocator<PDF>,
+                                 AllocStaticCommand: Allocator<StaticCommand>,
                                  AllocHL: Allocator<HistogramLiteral>,
                                  AllocHC: Allocator<HistogramCommand>,
                                  AllocHD: Allocator<HistogramDistance>,
@@ -144,6 +149,7 @@ pub fn BrotliCompressCustomAlloc<InputType,
    alloc_f64: AllocF64,
    alloc_fv: AllocFV,
    alloc_pdf: AllocPDF,
+   alloc_sc: AllocStaticCommand,
    alloc_hl: AllocHL,
    alloc_hc: AllocHC,
    alloc_hd: AllocHD,
@@ -155,7 +161,9 @@ pub fn BrotliCompressCustomAlloc<InputType,
   where InputType: Read,
         OutputType: Write
 {
-  let mut nop_callback = |_data:&[interface::Command<input_pair::InputReference>]|();
+  let mut nop_callback = |_data:&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                          _cmds: &mut [interface::StaticCommand],
+                          _mb: interface::InputPair|();
   BrotliCompressCustomIo(&mut IoReaderWrapper::<InputType>(r),
                            &mut IoWriterWrapper::<OutputType>(w),
                            input_buffer,
@@ -170,6 +178,7 @@ pub fn BrotliCompressCustomAlloc<InputType,
                            alloc_f64,
                            alloc_fv,
                            alloc_pdf,
+                           alloc_sc,
                            alloc_hl,
                            alloc_hc,
                            alloc_hd,
@@ -193,6 +202,7 @@ pub fn BrotliCompressCustomIo<ErrType,
                               AllocF64: Allocator<util::floatX>,
                               AllocFV: Allocator<Mem256f>,
                               AllocPDF: Allocator<PDF>,
+                              AllocStaticCommand: Allocator<StaticCommand>,
                               AllocHL: Allocator<HistogramLiteral>,
                               AllocHC: Allocator<HistogramCommand>,
                               AllocHD: Allocator<HistogramDistance>,
@@ -200,7 +210,9 @@ pub fn BrotliCompressCustomIo<ErrType,
                               AllocCT: Allocator<ContextType>,
                               AllocHT: Allocator<HuffmanTree>,
                               AllocZN: Allocator<ZopfliNode>,
-                              MetablockCallback: FnMut(&[interface::Command<input_pair::InputReference>])>
+                              MetablockCallback: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                       &mut [interface::StaticCommand],
+                                                       interface::InputPair)>
   (r: &mut InputType,
    w: &mut OutputType,
    input_buffer: &mut [u8],
@@ -215,6 +227,7 @@ pub fn BrotliCompressCustomIo<ErrType,
    mut mf64: AllocF64,
    mut mfv: AllocFV,
    mut mpdf: AllocPDF,
+   mut msc: AllocStaticCommand,
    mut mhl: AllocHL,
    mut mhc: AllocHC,
    mut mhd: AllocHD,
@@ -269,7 +282,7 @@ pub fn BrotliCompressCustomIo<ErrType,
           }
           let result = BrotliEncoderCompressStream(s,
                                                    &mut m64,
-                                                   &mut mf64, &mut mfv, &mut mpdf, &mut mhl, &mut mhc, &mut mhd, &mut mhp, &mut mct, &mut mht, &mut mzn,
+                                                   &mut mf64, &mut mfv, &mut mpdf, &mut msc, &mut mhl, &mut mhc, &mut mhd, &mut mhp, &mut mct, &mut mht, &mut mzn,
                                                    op,
                                                    &mut available_in,
                                                    input_buffer,

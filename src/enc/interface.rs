@@ -1,7 +1,7 @@
 #[allow(unused_imports)] // right now just used in feature flag
 use core;
 use alloc::{SliceWrapper, Allocator, SliceWrapperMut};
-use super::input_pair::{InputPair,InputReference};
+pub use super::input_pair::{InputPair,InputReference, InputReferenceMut};
 use super::histogram;
 #[derive(Debug,Copy,Clone,Default)]
 pub struct BlockSwitch(pub u8);
@@ -519,47 +519,221 @@ pub fn free_cmd<SliceTypeAllocator:Allocator<u8>> (xself: &mut Command<SliceType
     free_cmd_inline(xself, m8)
 }
 
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SliceOffset(pub usize, pub u32);
+impl SliceWrapper<u8> for SliceOffset {
+    fn slice(&self) -> &[u8] {
+        // not perfect--shouldn't be calling this without thawing the wrapper
+        &[]
+    }
+}
+
+pub trait Freezable {
+    fn freeze(&self) -> SliceOffset;
+}
+
+pub trait Unfreezable {
+    fn thaw<'a>(&self, data: &'a [u8]) -> InputReference<'a>;
+    fn thaw_mut<'a>(&self, data: &'a mut [u8]) -> InputReferenceMut<'a>;
+    fn thaw_pair<'a>(&self, pair: &InputPair<'a>) -> Result<InputReference<'a>, ()>;
+}
+
+impl<'a> From<InputReference<'a>> for SliceOffset {
+    fn from(f: InputReference<'a>) -> Self {
+        debug_assert!(f.data.len() <= 0xffffffff);
+        SliceOffset(f.orig_offset, f.data.len() as u32)
+    }
+}
+impl Unfreezable for SliceOffset {
+    fn thaw<'a>(&self, data: &'a [u8]) -> InputReference<'a> {
+        InputReference{
+            data: data.split_at(self.0).1.split_at(self.1 as usize).0,
+            orig_offset: self.0,
+        }
+    }
+    fn thaw_mut<'a>(&self, data: &'a mut [u8]) -> InputReferenceMut<'a> {
+        InputReferenceMut{
+            data: data.split_at_mut(self.0).1.split_at_mut(self.1 as usize).0,
+            orig_offset: self.0,
+        }
+    }
+    fn thaw_pair<'a>(&self, pair: &InputPair<'a>) -> Result<InputReference<'a>, ()> {
+        if self.0 >= pair.1.orig_offset {
+            return Ok(InputReference{
+                data: pair.1.data.split_at(self.0 - pair.1.orig_offset).1.split_at(self.1 as usize).0,
+                orig_offset: self.0,
+            });
+        }
+        let offset = self.0 - pair.0.orig_offset;
+        if offset + self.1 as usize <= pair.0.data.len() { // overlap
+            Ok(InputReference{
+                data: pair.0.data.split_at(offset).1.split_at(self.1 as usize).0,
+                orig_offset: self.0,
+            })
+        } else {
+            Err(())
+        }
+    }
+}
+impl SliceOffset {
+    pub fn offset(&self) -> usize {
+        self.0
+    }
+    pub fn len(&self) -> usize {
+        self.1 as usize
+    }
+    pub fn len32(&self) -> u32 {
+        self.1
+    }
+}
+
+
+
+pub type StaticCommand = Command<SliceOffset>;
+
 
 pub trait CommandProcessor<'a> {
-   fn push<Cb: FnMut(&[Command<InputReference>])>(&mut self,
-                                                             val: Command<InputReference<'a> >,
-                                                             callback :&mut Cb);
-   fn push_literals<Cb>(&mut self, data:&InputPair<'a>, callback: &mut Cb) where Cb:FnMut(&[Command<InputReference>]) {
+   fn push(&mut self,
+           val: Command<InputReference<'a> >);
+   fn push_literals(&mut self, data:&InputPair<'a>) {
         if data.0.len() != 0 {
             self.push(Command::Literal(LiteralCommand{
-                data:InputReference(data.0),
+                data: data.0,
                 prob:FeatureFlagSliceType::<InputReference>::default(),
                 high_entropy: false,
-            }), callback);
+            }));
         }
         if data.1.len() != 0 {
             self.push(Command::Literal(LiteralCommand{
-                data:InputReference(data.1),
+                data: data.1,
                 prob:FeatureFlagSliceType::<InputReference>::default(),
                 high_entropy: false,
-            }), callback);
+            }));
         }
    }
-   fn push_rand_literals<Cb>(&mut self, data:&InputPair<'a>, callback: &mut Cb) where Cb:FnMut(&[Command<InputReference>]) {
+   fn push_rand_literals(&mut self, data:&InputPair<'a>) {
         if data.0.len() != 0 {
             self.push(Command::Literal(LiteralCommand{
-                data:InputReference(data.0),
+                data:data.0,
                 prob:FeatureFlagSliceType::<InputReference>::default(),
                 high_entropy: true,
-            }), callback);
+            }));
         }
         if data.1.len() != 0 {
             self.push(Command::Literal(LiteralCommand{
-                data:InputReference(data.1),
+                data:data.1,
                 prob:FeatureFlagSliceType::<InputReference>::default(),
                 high_entropy: true,
-            }), callback);
+            }));
         }
    }
-   fn push_block_switch_literal<Cb>(&mut self, block_type: u8, callback: &mut Cb) where Cb:FnMut(&[Command<InputReference>]) {
-       self.push(Command::BlockSwitchLiteral(LiteralBlockSwitch::new(block_type, 0)), callback)
+   fn push_block_switch_literal(&mut self, block_type: u8) {
+       self.push(Command::BlockSwitchLiteral(LiteralBlockSwitch::new(block_type, 0)))
    }
 }
+
+
+pub fn thaw_pair<'a, SliceType: Unfreezable + SliceWrapper<u8>>(xself: &Command<SliceType>, data: &InputPair<'a>) -> Command<InputReference<'a>> {
+    match *xself {
+        Command::Literal(ref lit) => {
+            Command::Literal(LiteralCommand{
+                data:lit.data.thaw_pair(data).unwrap(),
+                prob:FeatureFlagSliceType::default(),
+                high_entropy: lit.high_entropy,
+            })
+        },
+        Command::PredictionMode(ref pm) => {
+            Command::PredictionMode(PredictionModeContextMap{
+                literal_context_map:pm.literal_context_map.thaw_pair(data).unwrap(),
+                predmode_speed_and_distance_context_map:pm.predmode_speed_and_distance_context_map.thaw_pair(data).unwrap(),
+            })
+        },
+        Command::Dict(ref d) => {
+            Command::Dict(d.clone())
+        },
+        Command::Copy(ref c) => {
+            Command::Copy(c.clone())
+        },
+        Command::BlockSwitchCommand(ref c) => {
+            Command::BlockSwitchCommand(c.clone())
+        },
+        Command::BlockSwitchLiteral(ref c) => {
+            Command::BlockSwitchLiteral(c.clone())
+        },
+        Command::BlockSwitchDistance(ref c) => {
+            Command::BlockSwitchDistance(c.clone())
+        },
+    }
+}
+
+pub fn thaw<'a, SliceType: Unfreezable + SliceWrapper<u8>>(xself: &Command<SliceType>, data: &'a[u8]) -> Command<InputReference<'a>> {
+    match *xself {
+        Command::Literal(ref lit) => {
+            Command::Literal(LiteralCommand{
+                data:lit.data.thaw(data),
+                prob:FeatureFlagSliceType::default(),
+                high_entropy: lit.high_entropy,
+            })
+        },
+        Command::PredictionMode(ref pm) => {
+            Command::PredictionMode(PredictionModeContextMap{
+                literal_context_map:pm.literal_context_map.thaw(data),
+                predmode_speed_and_distance_context_map:pm.predmode_speed_and_distance_context_map.thaw(data),
+            })
+        },
+        Command::Dict(ref d) => {
+            Command::Dict(d.clone())
+        },
+        Command::Copy(ref c) => {
+            Command::Copy(c.clone())
+        },
+        Command::BlockSwitchCommand(ref c) => {
+            Command::BlockSwitchCommand(c.clone())
+        },
+        Command::BlockSwitchLiteral(ref c) => {
+            Command::BlockSwitchLiteral(c.clone())
+        },
+        Command::BlockSwitchDistance(ref c) => {
+            Command::BlockSwitchDistance(c.clone())
+        },
+    }
+}
+
+impl <SliceType:SliceWrapper<u8>+Freezable> Command<SliceType> {
+    pub fn freeze(&self) -> Command<SliceOffset> {
+       match *self {
+          Command::Literal(ref lit) => {
+              Command::Literal(LiteralCommand{
+                  data:lit.data.freeze(),
+                  prob:FeatureFlagSliceType::default(),
+                  high_entropy: lit.high_entropy,
+              })
+          },
+          Command::PredictionMode(ref pm) => {
+              Command::PredictionMode(PredictionModeContextMap{
+                  literal_context_map:pm.literal_context_map.freeze(),
+                  predmode_speed_and_distance_context_map:pm.predmode_speed_and_distance_context_map.freeze(),
+              })
+          },
+          Command::Dict(ref d) => {
+               Command::Dict(d.clone())
+          },
+          Command::Copy(ref c) => {
+               Command::Copy(c.clone())
+          },
+          Command::BlockSwitchCommand(ref c) => {
+               Command::BlockSwitchCommand(c.clone())
+          },
+          Command::BlockSwitchLiteral(ref c) => {
+               Command::BlockSwitchLiteral(c.clone())
+          },
+          Command::BlockSwitchDistance(ref c) => {
+               Command::BlockSwitchDistance(c.clone())
+          },
+       }
+    }
+}
+
 
 #[inline(always)]
 pub fn speed_to_u8(data: u16) -> u8 {

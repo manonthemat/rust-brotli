@@ -10,6 +10,7 @@ use super::backward_references::{BrotliCreateBackwardReferences, Struct1, UnionH
 
 use super::vectorization::Mem256f;
 use super::interface;
+use super::interface::StaticCommand;
 use super::bit_cost::{BitsEntropy, ShannonEntropy};
 #[allow(unused_imports)]
 use super::block_split::BlockSplit;
@@ -19,7 +20,7 @@ use super::brotli_bit_stream::{BrotliBuildAndStoreHuffmanTreeFast, BrotliStoreHu
                                BrotliStoreMetaBlockTrivial, BrotliStoreUncompressedMetaBlock,
                                MetaBlockSplit, RecoderState};
                                
-use enc::input_pair::InputReference;
+use enc::input_pair::InputReferenceMut;
 use super::command::{Command, GetLengthCode, BrotliDistanceParams};
 use super::compress_fragment::BrotliCompressFragmentFast;
 use super::compress_fragment_two_pass::{BrotliCompressFragmentTwoPass, BrotliWriteBits};
@@ -2040,6 +2041,7 @@ pub fn BrotliEncoderCompress<AllocU8: alloc::Allocator<u8>,
                              AllocF64: alloc::Allocator<super::util::floatX>,
                              AllocFV: alloc::Allocator<Mem256f>,
                              AllocPDF: alloc::Allocator<PDF>,
+                             AllocStaticCommand: alloc::Allocator<StaticCommand>,
                              AllocHL: alloc::Allocator<HistogramLiteral>,
                              AllocHC: alloc::Allocator<HistogramCommand>,
                              AllocHD: alloc::Allocator<HistogramDistance>,
@@ -2048,7 +2050,9 @@ pub fn BrotliEncoderCompress<AllocU8: alloc::Allocator<u8>,
                              AllocCommand: alloc::Allocator<Command>,
                              AllocHT:alloc::Allocator<HuffmanTree>,
                              AllocZN:alloc::Allocator<ZopfliNode>,
-                             MetablockCallback: FnMut(&[interface::Command<InputReference>])>(
+                             MetablockCallback: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                      &mut [interface::StaticCommand],
+                                                      interface::InputPair)>(
     empty_m8: AllocU8,
     empty_m16: AllocU16,
     empty_m32: AllocU32,
@@ -2063,6 +2067,7 @@ pub fn BrotliEncoderCompress<AllocU8: alloc::Allocator<u8>,
     mf64: &mut AllocF64,
     mfv: &mut AllocFV,
     mpdf: &mut AllocPDF,
+    msc: &mut AllocStaticCommand,
     mhl: &mut AllocHL,
     mhc: &mut AllocHC,
     mhd: &mut AllocHD,
@@ -2139,7 +2144,7 @@ pub fn BrotliEncoderCompress<AllocU8: alloc::Allocator<u8>,
       }
       result = BrotliEncoderCompressStream(s,
                                              m64,
-                                             mf64, mfv, mpdf, mhl, mhc, mhd, mhp, mct, mht, mzn,
+                                             mf64, mfv, mpdf, msc, mhl, mhc, mhd, mhp, mct, mht, mzn,
                                              BrotliEncoderOperation::BROTLI_OPERATION_FINISH,
                                              &mut available_in,
                                              &mut next_in_array,
@@ -2626,6 +2631,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
                           AllocF64: alloc::Allocator<super::util::floatX>,
                           AllocFV: alloc::Allocator<Mem256f>,
                           AllocPDF: alloc::Allocator<PDF>,
+                          AllocStaticCommand: alloc::Allocator<StaticCommand>,
                           AllocHL: alloc::Allocator<HistogramLiteral>,
                           AllocHC: alloc::Allocator<HistogramCommand>,
                           AllocHD: alloc::Allocator<HistogramDistance>,
@@ -2639,6 +2645,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
              mf64: &mut AllocF64,
              mfv: &mut AllocFV,
              mpdf: &mut AllocPDF,
+             mc: &mut AllocStaticCommand,
              mhl: &mut AllocHL,
              mhc: &mut AllocHC,
              mhd: &mut AllocHD,
@@ -2665,7 +2672,9 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
              recoder_state: &mut RecoderState,
              storage_ix: &mut usize,
              storage: &mut [u8],
-            cb: &mut Cb) where Cb: FnMut(&[interface::Command<InputReference>]) {
+            cb: &mut Cb) where Cb: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                         &mut [interface::StaticCommand],
+                                         interface::InputPair) {
 
   let wrapped_last_flush_pos: u32 = WrapPosition(last_flush_pos);
   let last_bytes: u16;
@@ -2690,6 +2699,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
                                      mf64,
                                      mfv,
                                      mpdf,
+                                     mc,
                                      is_last,
                                      data,
                                      wrapped_last_flush_pos as (usize),
@@ -2720,6 +2730,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
                              mf64,
                              mfv,
                              mpdf,
+                             mc,
                              data,
                              wrapped_last_flush_pos as (usize),
                              bytes,
@@ -2737,7 +2748,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
       return;
     }
   } else if (*params).quality < 4i32 {
-    BrotliStoreMetaBlockTrivial(m8, m16, m32, mf64, mfv, mpdf,
+    BrotliStoreMetaBlockTrivial(m8, m16, m32, mf64, mfv, mpdf, mc,
                                 data,
                                 wrapped_last_flush_pos as (usize),
                                 bytes,
@@ -2808,7 +2819,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
         BrotliOptimizeHistograms(num_effective_dist_codes as usize,
                                &mut mb);
     }
-    BrotliStoreMetaBlock(m8, m16, m32, mf64, mfv, mpdf, mht,
+    BrotliStoreMetaBlock(m8, m16, m32, mf64, mfv, mpdf, mc, mht,
                          data,
                          wrapped_last_flush_pos as (usize),
                          bytes,
@@ -2842,6 +2853,7 @@ fn WriteMetaBlockInternal<AllocU8: alloc::Allocator<u8>,
                                        mf64,
                                        mfv,
                                        mpdf,
+                                       mc,
                                        is_last,
                                        data,
                                        wrapped_last_flush_pos as (usize),
@@ -2907,6 +2919,7 @@ fn EncodeData<AllocU8: alloc::Allocator<u8>,
               AllocF64: alloc::Allocator<super::util::floatX>,
               AllocFV: alloc::Allocator<Mem256f>,
               AllocPDF: alloc::Allocator<PDF>,
+              AllocStaticCommand: alloc::Allocator<StaticCommand>,
               AllocHL: alloc::Allocator<HistogramLiteral>,
               AllocHC: alloc::Allocator<HistogramCommand>,
               AllocHD: alloc::Allocator<HistogramDistance>,
@@ -2921,6 +2934,7 @@ fn EncodeData<AllocU8: alloc::Allocator<u8>,
     mf64: &mut AllocF64,
     mfv: &mut AllocFV,
     mpdf: &mut AllocPDF,
+    mc: &mut AllocStaticCommand,
     mhl: &mut AllocHL,
     mhc: &mut AllocHC,
     mhd: &mut AllocHD,
@@ -2933,7 +2947,9 @@ fn EncodeData<AllocU8: alloc::Allocator<u8>,
     out_size: &mut usize,
     callback: &mut MetablockCallback
 //              mut output: &'a mut &'a mut [u8]
-) -> i32 where MetablockCallback: FnMut(&[interface::Command<InputReference>]){
+) -> i32 where MetablockCallback: FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                        &mut [interface::StaticCommand],
+                                        interface::InputPair){
   let delta: u64 = UnprocessedInputSize(s);
   let mut bytes: u32 = delta as (u32);
   let mut wrapped_last_processed_pos: u32 = WrapPosition((*s).last_processed_pos_);
@@ -3129,7 +3145,7 @@ fn EncodeData<AllocU8: alloc::Allocator<u8>,
     let mut storage_ix: usize = (*s).last_bytes_bits_ as (usize);
     (*s).storage_.slice_mut()[(0usize)] = (*s).last_bytes_ as u8;
     (*s).storage_.slice_mut()[(1usize)] = ((*s).last_bytes_ >> 8) as u8;
-    WriteMetaBlockInternal(&mut (*s).m8, &mut (*s).m16, &mut (*s).m32, mf64, mfv, mpdf, mhl, mhc, mhd, mhp, mct, mht,
+    WriteMetaBlockInternal(&mut (*s).m8, &mut (*s).m16, &mut (*s).m32, mf64, mfv, mpdf, mc, mhl, mhc, mhd, mhp, mct, mht,
                            &mut (*s).ringbuffer_.data_mo.slice_mut()[((*s).ringbuffer_.buffer_index as usize)..],
                            mask as (usize),
                            (*s).last_flush_pos_,
@@ -3224,6 +3240,7 @@ fn ProcessMetadata<AllocU8: alloc::Allocator<u8>,
               AllocF64: alloc::Allocator<super::util::floatX>,
               AllocFV: alloc::Allocator<Mem256f>,
               AllocPDF: alloc::Allocator<PDF>,
+              AllocStaticCommand: alloc::Allocator<StaticCommand>,
               AllocHL: alloc::Allocator<HistogramLiteral>,
               AllocHC: alloc::Allocator<HistogramCommand>,
               AllocHD: alloc::Allocator<HistogramDistance>,
@@ -3232,12 +3249,15 @@ fn ProcessMetadata<AllocU8: alloc::Allocator<u8>,
               AllocCommand: alloc::Allocator<Command>,
                    AllocHT:alloc::Allocator<HuffmanTree>,
                    AllocZN:alloc::Allocator<ZopfliNode>,
-                   MetaBlockCallback:FnMut(&[interface::Command<InputReference>])>(
+                   MetaBlockCallback:FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                           &mut [interface::StaticCommand],
+                                           interface::InputPair)>(
     s: &mut BrotliEncoderStateStruct<AllocU8, AllocU16, AllocU32, AllocI32, AllocCommand>,
     m64: &mut AllocU64,
     mf64: &mut AllocF64,
     mfv: &mut AllocFV,
     mpdf: &mut AllocPDF,
+    mc: &mut AllocStaticCommand,
     mhl: &mut AllocHL,
     mhc: &mut AllocHC,
     mhd: &mut AllocHD,
@@ -3281,7 +3301,7 @@ fn ProcessMetadata<AllocU8: alloc::Allocator<u8>,
     if (*s).input_pos_ != (*s).last_flush_pos_ {
       let mut avail_out : usize = (*s).available_out_;
       let result: i32 =
-            EncodeData(s, m64, mf64, mfv, mpdf, mhl, mhc, mhd, mhp, mct, mht, mzn, 0i32, 1i32, &mut avail_out, metablock_callback);
+            EncodeData(s, m64, mf64, mfv, mpdf, mc, mhl, mhc, mhd, mhp, mct, mht, mzn, 0i32, 1i32, &mut avail_out, metablock_callback);
       (*s).available_out_ = avail_out;
       if result == 0 {
         return 0i32;
@@ -3545,6 +3565,7 @@ pub fn BrotliEncoderCompressStream<AllocU8: alloc::Allocator<u8>,
                                    AllocF64: alloc::Allocator<super::util::floatX>,
                                    AllocFV: alloc::Allocator<Mem256f>,
                                    AllocPDF: alloc::Allocator<PDF>,
+                                   AllocStaticCommand: alloc::Allocator<StaticCommand>,
                                    AllocHL: alloc::Allocator<HistogramLiteral>,
                                    AllocHC: alloc::Allocator<HistogramCommand>,
                                    AllocHD: alloc::Allocator<HistogramDistance>,
@@ -3553,12 +3574,15 @@ pub fn BrotliEncoderCompressStream<AllocU8: alloc::Allocator<u8>,
                                    AllocCommand: alloc::Allocator<Command>,
                                    AllocHT:alloc::Allocator<HuffmanTree>,
                                    AllocZN: alloc::Allocator<ZopfliNode>,
-                                   MetablockCallback:FnMut(&[interface::Command<InputReference>])>(
+                                   MetablockCallback:FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                           &mut [interface::StaticCommand],
+                                                           interface::InputPair)>(
     s: &mut BrotliEncoderStateStruct<AllocU8, AllocU16, AllocU32, AllocI32, AllocCommand>,
     m64: &mut AllocU64,
     mf64: &mut AllocF64,
     mfv: &mut AllocFV,
     mpdf: &mut AllocPDF,
+    mc: &mut AllocStaticCommand,
     mhl: &mut AllocHL,
     mhc: &mut AllocHC,
     mhd: &mut AllocHD,
@@ -3589,7 +3613,7 @@ pub fn BrotliEncoderCompressStream<AllocU8: alloc::Allocator<u8>,
   }
   if op as (i32) == BrotliEncoderOperation::BROTLI_OPERATION_EMIT_METADATA as (i32) {
     UpdateSizeHint(s, 0usize);
-    return ProcessMetadata(s, m64, mf64, mfv, mpdf, mhl, mhc, mhd, mhp, mct, mht, mzn, available_in, next_in_array, next_in_offset, available_out, next_out_array, next_out_offset, total_out, metablock_callback);
+    return ProcessMetadata(s, m64, mf64, mfv, mpdf, mc, mhl, mhc, mhd, mhp, mct, mht, mzn, available_in, next_in_array, next_in_offset, available_out, next_out_array, next_out_offset, total_out, metablock_callback);
   }
   if (*s).stream_state_ as (i32) ==
      BrotliEncoderStreamState::BROTLI_STREAM_METADATA_HEAD as (i32) ||
@@ -3653,7 +3677,7 @@ pub fn BrotliEncoderCompressStream<AllocU8: alloc::Allocator<u8>,
         UpdateSizeHint(s, *available_in);
         let mut avail_out = (*s).available_out_;
         result = EncodeData(s,
-                            m64, mf64, mfv, mpdf, mhl, mhc, mhd, mhp, mct, mht, mzn,
+                            m64, mf64, mfv, mpdf, mc, mhl, mhc, mhd, mhp, mct, mht, mzn,
                             is_last,
                             force_flush,
                             &mut avail_out,
@@ -3776,6 +3800,7 @@ pub fn BrotliEncoderWriteData<'a, AllocU8: alloc::Allocator<u8>,
                               AllocF64: alloc::Allocator<super::util::floatX>,
                               AllocFV: alloc::Allocator<Mem256f>,
                               AllocPDF: alloc::Allocator<PDF>,
+                              AllocStaticCommand: alloc::Allocator<StaticCommand>,
                               AllocHL: alloc::Allocator<HistogramLiteral>,
                               AllocHC: alloc::Allocator<HistogramCommand>,
                               AllocHD: alloc::Allocator<HistogramDistance>,
@@ -3784,12 +3809,15 @@ pub fn BrotliEncoderWriteData<'a, AllocU8: alloc::Allocator<u8>,
                               AllocCommand: alloc::Allocator<Command>,
                               AllocHT:alloc::Allocator<HuffmanTree>,
                               AllocZN:alloc::Allocator<ZopfliNode>,
-                              MetablockCallback:FnMut(&[interface::Command<InputReference>])>(
+                              MetablockCallback:FnMut(&mut interface::PredictionModeContextMap<InputReferenceMut>,
+                                                       &mut [interface::StaticCommand],
+                                                       interface::InputPair)>(
     s: &'a mut BrotliEncoderStateStruct<AllocU8, AllocU16, AllocU32, AllocI32, AllocCommand>,
     m64: &mut AllocU64,
     mf64: &mut AllocF64,
     mfv: &mut AllocFV,
     mpdf: &mut AllocPDF,
+    mc: &mut AllocStaticCommand,
     mhl: &mut AllocHL,
     mhc: &mut AllocHC,
     mhd: &mut AllocHD,
@@ -3803,7 +3831,7 @@ pub fn BrotliEncoderWriteData<'a, AllocU8: alloc::Allocator<u8>,
     output: &'a mut &'a mut [u8],
     metablock_callback: &mut MetablockCallback)
                               -> i32 {
-    let ret = EncodeData(s, m64, mf64, mfv, mpdf, mhl, mhc, mhd, mhp, mct, mht, mzn, is_last, force_flush, out_size, metablock_callback);
+    let ret = EncodeData(s, m64, mf64, mfv, mpdf, mc, mhl, mhc, mhd, mhp, mct, mht, mzn, is_last, force_flush, out_size, metablock_callback);
     *output = (*s).storage_.slice_mut();
     ret
 }

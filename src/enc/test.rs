@@ -12,6 +12,7 @@ use super::histogram::{ContextType, HistogramLiteral, HistogramCommand, Histogra
 use super::super::alloc::{AllocatedStackMemory, Allocator, SliceWrapper, SliceWrapperMut,
                           StackAllocator, bzero};
 use enc::util::brotli_min_size_t;
+use super::StaticCommand;
 extern "C" {
   fn calloc(n_elem: usize, el_size: usize) -> *mut u8;
 }
@@ -70,6 +71,8 @@ fn oneshot_compress(input: &[u8],
     unsafe { define_allocator_memory_pool!(48, Command, [0; 128 * 1024], calloc) };
   let stack_pdf_buffer =
     unsafe { define_allocator_memory_pool!(48, PDF, [0; 1], calloc) };
+  let stack_sc_buffer =
+    unsafe { define_allocator_memory_pool!(48, StaticCommand, [0; 100], calloc) };
   let stack_u8_allocator = CallocatedFreelist4096::<u8>::new_allocator(stack_u8_buffer.data, bzero);
   let stack_u16_allocator = CallocatedFreelist4096::<u16>::new_allocator(stack_u16_buffer.data,
                                                                          bzero);
@@ -84,6 +87,7 @@ fn oneshot_compress(input: &[u8],
   let mut mf64 = CallocatedFreelist2048::<super::util::floatX>::new_allocator(stack_f64_buffer.data, bzero);
   let mut mfv = CallocatedFreelist2048::<Mem256f>::new_allocator(stack_fv_buffer.data, bzero);
   let mut mpdf = CallocatedFreelist2048::<PDF>::new_allocator(stack_pdf_buffer.data, bzero);
+  let mut msc = CallocatedFreelist2048::<StaticCommand>::new_allocator(stack_sc_buffer.data, bzero);
   let stack_mc_allocator = CallocatedFreelist2048::<Command>::new_allocator(stack_mc_buffer.data,
                                                                             bzero);
   let mut mhl = CallocatedFreelist2048::<HistogramLiteral>::new_allocator(stack_hl_buffer.data,
@@ -134,12 +138,16 @@ fn oneshot_compress(input: &[u8],
       } else {
         op = BrotliEncoderOperation::BROTLI_OPERATION_PROCESS;
       }
-      let mut nop = |_data:&[interface::Command<input_pair::InputReference>]|();
+      let mut nop_callback = |_pm:&mut interface::PredictionModeContextMap<input_pair::InputReferenceMut>,
+                              _queue:&mut [interface::Command<interface::SliceOffset>],
+                              _mb:interface::InputPair|();
+
       let result = BrotliEncoderCompressStream(s,
                                                &mut stack_u64_allocator,
                                                &mut mf64,
                                                &mut mfv,
                                                &mut mpdf,
+                                               &mut msc,
                                                &mut mhl,
                                                &mut mhc,
                                                &mut mhd,
@@ -155,7 +163,7 @@ fn oneshot_compress(input: &[u8],
                                                output,
                                                &mut next_out_offset,
                                                &mut total_out,
-                                               &mut nop);
+                                               &mut nop_callback);
       if result <= 0 {
         return (result, next_out_offset);
       }

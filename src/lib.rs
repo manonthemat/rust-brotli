@@ -41,6 +41,11 @@ pub use brotli_decompressor::io_wrappers::{CustomRead, CustomWrite};
 pub use brotli_decompressor::io_wrappers::{IntoIoReader, IoReaderWrapper, IoWriterWrapper};
 pub use enc::interface;
 pub use enc::input_pair::InputReference;
+pub use enc::input_pair::InputReferenceMut;
+pub use enc::input_pair::InputPair;
+pub use enc::interface::SliceOffset;
+pub use enc::interface::thaw;
+pub use enc::interface::thaw_pair;
 // interface
 // pub fn BrotliDecompressStream(mut available_in: &mut usize,
 //                               input_offset: &mut usize,
